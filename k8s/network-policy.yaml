@@ -1,0 +1,23 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-api-ingress
+  namespace: devops-lab
+  labels:
+    app.kubernetes.io/part-of: secure-docker-microservice-lab
+spec:
+  # Select only backend pods; all other ingress sources are denied.
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: backend-api
+  policyTypes:
+    - Ingress
+  # No egress policy is imposed; this rule isolates only inbound API traffic.
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: nginx
+      ports:
+        - protocol: TCP
+          port: 8000

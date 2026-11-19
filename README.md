@@ -62,6 +62,108 @@ To stop the services, run `docker compose down`.
 
 > If Docker reports that `172.28.0.0/16` overlaps with another network, choose an unused private CIDR in `docker-compose.yml`.
 
+## Kubernetes Deployment (Local Cluster)
+
+The Kubernetes manifests provide a separate local deployment path; the existing Compose setup and SSH deployment helper remain unchanged. The backend runs with two replicas behind a private `ClusterIP` service. Nginx terminates TLS and is exposed by a `NodePort` service.
+
+```text
+Browser / curl
+     | HTTPS :30443 (NodePort) or kubectl port-forward
+     v
+Nginx Deployment (2 replicas; TLS Secret + ConfigMap)
+     | HTTP :8000 (ClusterIP DNS: backend-api)
+     v
+FastAPI Deployment (2 replicas)
+     ^ Ingress allowed only from pods labeled app.kubernetes.io/name=nginx
+     | NetworkPolicy
+```
+
+| Concept | Docker Compose | Kubernetes |
+| --- | --- | --- |
+| Private backend access | `internal_net`; only Nginx and the backend join it | `backend-api` is a `ClusterIP`; a `NetworkPolicy` restricts backend ingress to Nginx pods |
+| Service discovery | Docker embedded DNS resolves `backend-api` | Cluster DNS resolves `backend-api` to its `ClusterIP` |
+| Configuration and TLS | Read-only bind mounts from `nginx/` | Nginx `ConfigMap` and namespace-scoped TLS `Secret` (`myapp-tls`) |
+| Process hardening | Non-root backend, read-only filesystems, dropped capabilities | Restricted namespace, non-root containers, read-only filesystems, dropped capabilities, and `RuntimeDefault` seccomp |
+| Health and capacity | Docker health checks | Kubernetes probes, resource requests/limits, and two backend replicas |
+| External access | Host ports 80/443 on Nginx | Nginx `NodePort` on 30080/30443; backend has no external port |
+
+### Start a local cluster
+
+Requirements: Docker, `kubectl`, Bash, and a local Kubernetes cluster. The helper script supports **kind**, **Minikube**, and **Docker Desktop Kubernetes**. Network policies are enforced by the cluster's CNI plugin; for a policy test, use a policy-capable CNI (for example, start Minikube with `minikube start --cni=calico`). The default kindnet CNI does not enforce `NetworkPolicy`.
+
+1. Start or select a local cluster, then confirm the active context:
+
+   ```sh
+   kubectl config current-context
+   ```
+
+   Minikube example:
+
+   ```sh
+   minikube start --cni=calico
+   ```
+
+2. From the project root, run the setup script:
+
+   ```sh
+   bash scripts/k8s-setup.sh
+   ```
+
+   It generates the self-signed certificate if either certificate file is absent, creates or updates the `myapp-tls` Secret, builds `devops-lab-backend:local` and `devops-lab-nginx:local`, loads the images into kind or Minikube when selected, applies `k8s/`, and waits for both Deployments. Docker Desktop Kubernetes uses the local Docker image store. For manual image loading, use `kind load docker-image devops-lab-backend:local devops-lab-nginx:local` or run `minikube image load devops-lab-backend:local` and `minikube image load devops-lab-nginx:local` before applying the manifests.
+
+3. Check that the pods and services are ready:
+
+   ```sh
+   kubectl get pods,services,networkpolicies -n devops-lab
+   ```
+
+4. Test HTTPS. Port-forwarding works across local cluster providers; in another terminal run:
+
+   ```sh
+   kubectl port-forward -n devops-lab service/nginx 8443:443
+   ```
+
+   Then request the backend through Nginx:
+
+   ```sh
+   curl -k --resolve myapp.local:8443:127.0.0.1 https://myapp.local:8443/
+   curl -k --resolve myapp.local:8443:127.0.0.1 https://myapp.local:8443/health
+   ```
+
+   The local certificate is self-signed, so `-k` is needed. With Minikube, you can also use its node IP and the HTTPS NodePort:
+
+   ```sh
+   curl -k --resolve myapp.local:30443:"$(minikube ip)" https://myapp.local:30443/health
+   ```
+
+   HTTP on NodePort 30080 redirects to HTTPS NodePort 30443:
+
+   ```sh
+   curl -I --resolve myapp.local:30080:"$(minikube ip)" http://myapp.local:30080/
+   ```
+
+5. Verify the policy allows Nginx but blocks an unrelated pod. The first command should return the health response:
+
+   ```sh
+   kubectl exec -n devops-lab deployment/nginx -- wget -qO- http://backend-api:8000/health
+   ```
+
+   The following command is expected to **fail or time out** when the CNI enforces the policy. A successful response means the policy is not being enforced:
+
+   ```sh
+   kubectl run network-policy-test -n devops-lab --rm -i --restart=Never \
+     --image=devops-lab-backend:local --image-pull-policy=IfNotPresent \
+     -- python -c "import urllib.request; urllib.request.urlopen('http://backend-api:8000/health', timeout=3)"
+   ```
+
+6. Remove the Kubernetes resources when finished:
+
+   ```sh
+   kubectl delete namespace devops-lab
+   ```
+
+   This removes the Deployments, Services, NetworkPolicy, ConfigMap, and TLS Secret. It does not affect the Docker Compose stack or local images.
+
 ## What this demonstrates
 
 - **Private IP and subnet:** Compose defines an isolated bridge network with an explicit CIDR.
